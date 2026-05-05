@@ -14,8 +14,6 @@
 #elif defined(BOARD_WAVESHARE_C6_1_9)
 #include "board_waveshare_c6_1.9.h"
 #else
-#else
-#else
 /* Default board */
 #include "board_esp32s3_6buttons.h"
 #endif
