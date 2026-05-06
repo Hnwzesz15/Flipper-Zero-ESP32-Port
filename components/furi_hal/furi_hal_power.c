@@ -27,15 +27,15 @@
 
 #define TAG "FuriHalPower"
 
-#define FURI_HAL_POWER_USB_PRESENT_THRESHOLD_V  (4.6f)
-#define FURI_HAL_POWER_LOW_BATTERY_THRESHOLD_V  (3.35f)
-#define FURI_HAL_POWER_EMPTY_BATTERY_VOLTAGE_V  (3.27f)
-#define FURI_HAL_POWER_FULL_BATTERY_VOLTAGE_V   (4.20f)
-#define FURI_HAL_POWER_ADC_DIVIDER_RATIO        (2.0f)
-#define FURI_HAL_POWER_SAMPLE_REFRESH_US        (250000LL)
-#define FURI_HAL_POWER_CHARGE_LIMIT_MIN_V       (3.840f)
-#define FURI_HAL_POWER_CHARGE_LIMIT_MAX_V       (4.208f)
-#define FURI_HAL_POWER_CHARGE_LIMIT_STEP_V      (0.016f)
+#define FURI_HAL_POWER_USB_PRESENT_THRESHOLD_V  (4.6f)    // leave alone
+#define FURI_HAL_POWER_LOW_BATTERY_THRESHOLD_V  (3.05f)   // was 3.35f
+#define FURI_HAL_POWER_EMPTY_BATTERY_VOLTAGE_V  (2.90f)   // was 3.27f
+#define FURI_HAL_POWER_FULL_BATTERY_VOLTAGE_V   (4.20f)   // leave alone
+#define FURI_HAL_POWER_ADC_DIVIDER_RATIO        (2.0f)    // leave alone
+#define FURI_HAL_POWER_SAMPLE_REFRESH_US        (250000LL)// leave alone
+#define FURI_HAL_POWER_CHARGE_LIMIT_MIN_V       (3.840f)  // leave alone
+#define FURI_HAL_POWER_CHARGE_LIMIT_MAX_V       (4.208f)  // leave alone
+#define FURI_HAL_POWER_CHARGE_LIMIT_STEP_V      (0.016f)  // leave alone
 
 typedef struct {
     bool initialized;
