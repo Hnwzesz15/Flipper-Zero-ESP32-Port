@@ -62,7 +62,9 @@ idf_component_register(
     SRCS ${FURI_HAL_SRCS}
     INCLUDE_DIRS "." ".." "../.." "boards"
     REQUIRES ${FURI_HAL_REQUIRES}
+    PRIV_REQUIRES esp_lcd_ili9341
 )
+
 
 # Set board include path as compile definition
 target_compile_definitions(${COMPONENT_LIB} PUBLIC
