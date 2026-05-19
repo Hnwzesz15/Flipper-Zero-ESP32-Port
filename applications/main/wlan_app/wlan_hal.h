@@ -14,6 +14,12 @@ void wlan_hal_stop(void);
 
 bool wlan_hal_is_started(void);
 
+/** Stellt nur den WLAN-Worker-Task + Command-Queue sicher, ohne den WiFi-
+ *  Stack zu initialisieren. Nötig, bevor wlan_hal_run_in_worker()/Evil-
+ *  Portal aufgerufen werden, falls vorher kein wlan_hal_start() lief.
+ *  Idempotent. */
+bool wlan_hal_ensure_worker(void);
+
 /** Synchroner aktiver Scan auf allen Channels. Allokiert *out_records via
  *  malloc; Caller frees. Bei *out_count == 0 ist *out_records NULL. */
 void wlan_hal_scan(wifi_ap_record_t** out_records, uint16_t* out_count, uint16_t max_count);
@@ -93,6 +99,8 @@ typedef struct {
     const char* ssid;
     uint8_t channel;
     bool verify_creds;            // Router-Mode: gegen echte APs verifizieren
+    bool karma;                   // Karma: Probe-Requests sniffen + AP-SSID
+                                  // dynamisch auf die meistgesuchte SSID stellen
     const char* html;
     size_t html_len;
     const char* router_ssid_options; // optional, ersetzt %SSID_OPTIONS%
@@ -113,3 +121,10 @@ void wlan_hal_evil_portal_resume(void);
 bool wlan_hal_evil_portal_is_paused(void);
 uint32_t wlan_hal_evil_portal_get_cred_count(void);
 uint16_t wlan_hal_evil_portal_get_client_count(void);
+
+/** Karma: Anzahl bisher geernteter (eindeutiger) Probe-SSIDs. */
+uint16_t wlan_hal_evil_portal_karma_get_ssid_count(void);
+
+/** Karma: aktuell vom SoftAP gespoofte SSID nach out kopieren.
+ *  Liefert false wenn Karma inaktiv. */
+bool wlan_hal_evil_portal_karma_get_current(char* out, size_t out_size);

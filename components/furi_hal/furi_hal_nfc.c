@@ -151,6 +151,15 @@ static bool listener_activated = false;    /* PN532 target mode active (reader p
 static uint8_t listener_rx_buf[253];
 static size_t listener_rx_len = 0;
 
+/* Type-4 (ISO-DEP) NDEF emulation: when set, listener_wait_event runs a
+ * self-contained Bruce-style TgInitAsTarget/TgGetData/TgSetData APDU loop
+ * (PN532 handles RATS/ATS + ISO-DEP framing + WTX in hardware, so the slow
+ * host round-trip no longer blows the MIFARE-UL FWT). Detected by readers as
+ * a generic ISO14443-4 NDEF tag — not a byte-exact NTAG clone — but the NDEF
+ * payload transfers reliably. emu_ndef_len == 0 → fall back to raw type-A. */
+static uint8_t emu_ndef_msg[888];
+static size_t emu_ndef_len = 0;
+
 /* FeliCa listener configuration state */
 static uint8_t felica_idm[8];
 static uint8_t felica_pmm[8];
@@ -298,7 +307,12 @@ static FuriHalNfcError pn532_send_command(
     esp_err_t err = i2c_master_write_to_device(
         BOARD_NFC_I2C_PORT, PN532_I2C_ADDR, frame, idx, pdMS_TO_TICKS(1000));
     if(err != ESP_OK) {
-        FURI_LOG_E(TAG, "I2C write failed: %s", esp_err_to_name(err));
+        /* DEBUG: log which PN532 command failed (cmd[0] = opcode, e.g.
+         * 0x8C TgInitAsTarget, 0x86 TgGetData, 0x4A InListPassiveTarget) so
+         * we can tell the poller→listener transition apart from a real bus
+         * lockup. */
+        FURI_LOG_E(TAG, "I2C write failed: %s (cmd=0x%02X len=%u)",
+            esp_err_to_name(err), cmd_len ? cmd[0] : 0xFF, (unsigned)cmd_len);
         return FuriHalNfcErrorCommunication;
     }
 
@@ -456,6 +470,9 @@ FuriHalNfcError furi_hal_nfc_set_mode(FuriHalNfcMode mode, FuriHalNfcTech tech) 
      * child pollers fail to even activate and the EMV poller never gets to
      * send PPSE. By preserving target_number/atqa/sak/uid/ats across same-tech
      * transitions, the next short-frame REQA can use the existing cache. */
+    /* Any poller start cancels a pending Type-4 NDEF emulation arm so a
+     * subsequent card read is never hijacked by the emulation path. */
+    if(mode == FuriHalNfcModePoller) emu_ndef_len = 0;
     bool tech_changed = (tech != nfc_current_tech);
     nfc_current_mode = mode;
     nfc_current_tech = tech;
@@ -553,10 +570,216 @@ static bool nfc_listener_abort_requested(void) {
     return true;
 }
 
+void furi_hal_nfc_emu_set_ndef(const uint8_t* msg, size_t len) {
+    if(msg == NULL || len == 0 || len > sizeof(emu_ndef_msg)) {
+        emu_ndef_len = 0;
+        return;
+    }
+    memcpy(emu_ndef_msg, msg, len);
+    emu_ndef_len = len;
+}
+
+/* Bruce-style ISO-DEP Type-4 NDEF tag emulation, run entirely inside the HAL.
+ * The PN532 handles ISO14443-3A activation, RATS/ATS and ISO-DEP framing
+ * (incl. WTX) in hardware; we only service ISO7816 SELECT / READ BINARY
+ * APDUs from an in-memory CC + NDEF file. No upper-stack thread round-trip,
+ * and ISO-DEP WTX tolerates the host latency that killed raw NTAG emulation.
+ * Returns AbortRequest when the user aborts. */
+static FuriHalNfcEvent pn532_type4_ndef_emulate(void) {
+    /* Standard NFC-Forum Type-4 Capability Container (mirrors Bruce):
+     *  CCLEN=000F, mapping v2.0, MLe=003B, MLc=0034,
+     *  NDEF File Control TLV: T=04 L=06 FileID=E104 MaxLen WriteAccess(FF=ro) */
+    size_t ndef_file_len = 2 + emu_ndef_len; /* NLEN(2) + message */
+    uint16_t ndef_cap = (ndef_file_len > 0xFFFE) ? 0xFFFE : (uint16_t)ndef_file_len;
+    uint8_t cc[15] = {
+        0x00, 0x0F, 0x20, 0x00, 0x3B, 0x00, 0x34, 0x04,
+        0x06, 0xE1, 0x04, (uint8_t)(ndef_cap >> 8), (uint8_t)(ndef_cap & 0xFF), 0x00, 0xFF};
+
+    /* TgInitAsTarget payload — SEL_RES=0x60 (bit5 set ⇒ ISO14443-4 capable),
+     * so the reader runs RATS and the PN532 takes over ISO-DEP framing.
+     * SENS_RES (bytes 2-3) and NFCID1t (bytes 4-6) are overridden below with
+     * the original tag's ATQA / first 3 UID bytes so the ISO-DEP clone is as
+     * close to the source NTAG as the PN532 allows (it can only present a
+     * 3-byte single-size NFCID1 in target mode — a 7-byte UID can't be
+     * cloned exactly, and SEL_RES must stay 0x60 for ISO-DEP to work). */
+    uint8_t tg_init[] = {
+        PN532_CMD_TGINITASTARGET, 0x00, 0x08, 0x00, 0xDC, 0x44, 0x20, 0x60,
+        0x01, 0xFE, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xC0, 0xC1, 0xC2, 0xC3,
+        0xC4, 0xC5, 0xC6, 0xC7, 0xFF, 0xFF, 0xAA, 0x99, 0x88, 0x77, 0x66, 0x55,
+        0x44, 0x33, 0x22, 0x11, 0x01, 0x00, 0x0D, 0x52, 0x46, 0x49, 0x44, 0x49,
+        0x4F, 0x74, 0x20, 0x50, 0x4E, 0x35, 0x33, 0x32};
+    /* Do NOT override SENS_RES / NFCID1 with the scanned tag's ATQA/UID.
+     * The known-working Bruce reference (same PN532 HW, multi-boot/bruce
+     * PN532.cpp tgInitAsTargetIrq) uses these FIXED defaults — overriding
+     * SENS_RES with e.g. NTAG213's ATQA produced an invalid value (00 44)
+     * that the phone never activates. For Type-4 ISO-DEP NDEF the reader
+     * only needs a valid ISO14443-4 PICC (SEL_RES=0x60), not a UID clone. */
+
+    enum { FILE_NONE, FILE_CC, FILE_NDEF } cur_file = FILE_NONE;
+    bool armed = false;
+    uint32_t tginit_tries = 0; /* throttle the retry log */
+
+    FURI_LOG_I(TAG, "Type-4 NDEF emu: enter (ndef_len=%u, SENS=%02X%02X SEL=%02X)",
+        (unsigned)emu_ndef_len, tg_init[2], tg_init[3], tg_init[7]);
+
+    while(true) {
+        if(nfc_listener_abort_requested()) {
+            return FuriHalNfcEventAbortRequest;
+        }
+
+        if(!armed) {
+            uint8_t r[16];
+            size_t rl = sizeof(r);
+            /* 1500 ms single wait (matches Bruce): each re-issue cancels the
+             * PN532's pending TgInitAsTarget, so a short 300 ms window churned
+             * faster than a phone can detect+activate the emulated PICC. */
+            FuriHalNfcError e =
+                pn532_send_command((uint8_t*)tg_init, sizeof(tg_init), r, &rl, 1500);
+            if(e == FuriHalNfcErrorNone && rl >= 1) {
+                armed = true;
+                cur_file = FILE_NONE;
+                /* r[0] = TgInitAsTarget "Mode" byte: bits0-1 baud, bit2 PICC
+                 * ISO14443-4, bit3 DEP. 0x04/0x05 = activated as ISO-DEP PICC. */
+                FURI_LOG_I(TAG, "Type-4 emu: target ACTIVATED (mode=%02X, rl=%u) after %lu tries",
+                    r[0], (unsigned)rl, (unsigned long)tginit_tries);
+            } else {
+                /* Log first attempt + every ~2s so we can tell "never
+                 * activated" (reader not seeing the tag) from a crash. */
+                if(tginit_tries == 0 || (tginit_tries % 100) == 0) {
+                    FURI_LOG_I(TAG, "Type-4 emu: TgInitAsTarget waiting (err=%d rl=%u try=%lu)",
+                        (int)e, (unsigned)rl, (unsigned long)tginit_tries);
+                }
+                tginit_tries++;
+                furi_delay_ms(20);
+                continue;
+            }
+        }
+
+        /* TgGetData: fetch reader APDU */
+        uint8_t gd = PN532_CMD_TGGETDATA;
+        uint8_t req[262];
+        size_t req_len = sizeof(req);
+        FuriHalNfcError ge = pn532_send_command(&gd, 1, req, &req_len, 500);
+
+        if(ge != FuriHalNfcErrorNone || req_len < 1) {
+            furi_delay_ms(10);
+            continue;
+        }
+        uint8_t status = req[0];
+        if(status == 0x29 || status == 0x25 || status == 0x0A) {
+            /* RF lost / target released — re-arm */
+            FURI_LOG_I(TAG, "Type-4 emu: RF lost (status=%02X) — re-arming", status);
+            armed = false;
+            furi_delay_ms(10);
+            continue;
+        }
+        if(status != 0x00 || req_len < 5) {
+            FURI_LOG_D(TAG, "Type-4 emu: TgGetData status=%02X len=%u (skip)",
+                status, (unsigned)req_len);
+            furi_delay_ms(5);
+            continue;
+        }
+
+        /* APDU = req[1..] : CLA INS P1 P2 LC [DATA] [LE] */
+        const uint8_t* a = &req[1];
+        size_t alen = req_len - 1;
+        uint8_t ins = a[1];
+        uint8_t p1 = a[2];
+        uint8_t p2 = a[3];
+        uint8_t lc = a[4];
+        uint16_t off = ((uint16_t)p1 << 8) | p2;
+
+        FURI_LOG_I(TAG, "Type-4 emu: APDU CLA=%02X INS=%02X P1P2=%04X Lc=%02X (alen=%u)",
+            a[0], ins, off, lc, (unsigned)alen);
+
+        uint8_t resp[260];
+        size_t resp_len = 0;
+
+        if(ins == 0xA4) { /* SELECT */
+            if(p1 == 0x04) { /* by name (AID) */
+                resp[0] = 0x90;
+                resp[1] = 0x00;
+                resp_len = 2;
+            } else if(p1 == 0x00 && lc == 2 && alen >= 7) { /* by file id */
+                uint8_t f0 = a[5], f1 = a[6];
+                if(f0 == 0xE1 && f1 == 0x03) {
+                    cur_file = FILE_CC;
+                    resp[0] = 0x90;
+                    resp[1] = 0x00;
+                    resp_len = 2;
+                } else if(f0 == 0xE1 && f1 == 0x04) {
+                    cur_file = FILE_NDEF;
+                    resp[0] = 0x90;
+                    resp[1] = 0x00;
+                    resp_len = 2;
+                } else {
+                    resp[0] = 0x6A;
+                    resp[1] = 0x82;
+                    resp_len = 2;
+                }
+            } else {
+                resp[0] = 0x6A;
+                resp[1] = 0x82;
+                resp_len = 2;
+            }
+        } else if(ins == 0xB0) { /* READ BINARY */
+            uint8_t le = (alen >= 5) ? a[4] : 0;
+            size_t want = (le == 0) ? 0xFF : le;
+            if(want > sizeof(resp) - 2) want = sizeof(resp) - 2;
+            if(cur_file == FILE_CC) {
+                for(size_t i = 0; i < want; i++)
+                    resp[i] = (off + i < sizeof(cc)) ? cc[off + i] : 0x00;
+                resp_len = want;
+            } else if(cur_file == FILE_NDEF) {
+                for(size_t i = 0; i < want; i++) {
+                    size_t idx = off + i;
+                    uint8_t b;
+                    if(idx == 0)
+                        b = (uint8_t)(emu_ndef_len >> 8);
+                    else if(idx == 1)
+                        b = (uint8_t)(emu_ndef_len & 0xFF);
+                    else if(idx - 2 < emu_ndef_len)
+                        b = emu_ndef_msg[idx - 2];
+                    else
+                        b = 0x00;
+                    resp[i] = b;
+                }
+                resp_len = want;
+            } else {
+                resp_len = 0;
+            }
+            resp[resp_len++] = 0x90;
+            resp[resp_len++] = 0x00;
+        } else { /* UPDATE BINARY / unsupported → read-only */
+            resp[0] = 0x6A;
+            resp[1] = 0x81;
+            resp_len = 2;
+        }
+
+        /* TgSetData: send R-APDU back to the reader */
+        uint8_t sd[2 + sizeof(resp)];
+        sd[0] = PN532_CMD_TGSETDATA;
+        memcpy(&sd[1], resp, resp_len);
+        uint8_t sr[8];
+        size_t srl = sizeof(sr);
+        FuriHalNfcError se = pn532_send_command(sd, resp_len + 1, sr, &srl, 500);
+        if(se != FuriHalNfcErrorNone) {
+            armed = false;
+            furi_delay_ms(10);
+        }
+    }
+}
+
 FuriHalNfcEvent furi_hal_nfc_listener_wait_event(uint32_t timeout_ms) {
     if(!nfc_hal_ready) return FuriHalNfcEventTimeout;
 
     if(nfc_listener_abort_requested()) return FuriHalNfcEventAbortRequest;
+
+    /* Type-4 NDEF emulation path (Bruce-style) — bypasses the raw type-A
+     * listener entirely when an NDEF message has been armed. */
+    if(emu_ndef_len > 0) {
+        return pn532_type4_ndef_emulate();
+    }
 
     if(!listener_activated && listener_configured) {
         /* TgInitAsTarget: wait for a reader to activate us. We poll in short
@@ -566,9 +789,20 @@ FuriHalNfcEvent furi_hal_nfc_listener_wait_event(uint32_t timeout_ms) {
         uint8_t cmd[40];
         size_t idx = 0;
         cmd[idx++] = PN532_CMD_TGINITASTARGET;
-        cmd[idx++] = 0x05; /* Mode: passive 106kbps, PICC only */
+        /* Mode 0x01 = PassiveOnly (bit0). PICCOnly (bit2) MUST NOT be set:
+         * it tells the PN532 to emulate an ISO14443-4 PICC, which makes
+         * readers see the tag as a generic ISO14443-3A / ISO-DEP target (or
+         * fall back to a FeliCa probe) instead of MIFARE Classic. With
+         * PassiveOnly the PN532 answers REQA/anti-collision with our cached
+         * SENS_RES (ATQA) / NFCID1 / SEL_RES (SAK), so the reader detects a
+         * MIFARE Classic 1K. (Crypto1 AUTH still can't be answered — PN532
+         * hardware limitation — but UID/SAK-level emulation works.) */
+        cmd[idx++] = 0x01;
 
-        /* Mifare params: SENS_RES (2) + NFCID1 (3) + SEL_RES (1) */
+        /* Mifare params: SENS_RES (2) + NFCID1 (3) + SEL_RES (1).
+         * TgInitAsTarget only accepts a 3-byte NFCID1 — for a 4-byte MIFARE
+         * UID the PN532 generates the 4th byte itself, so the emulated UID's
+         * last byte cannot be controlled (PN532 limitation). */
         cmd[idx++] = listener_atqa[0];
         cmd[idx++] = listener_atqa[1];
         cmd[idx++] = (listener_uid_len >= 1) ? listener_uid[0] : 0x00;
@@ -597,17 +831,54 @@ FuriHalNfcEvent furi_hal_nfc_listener_wait_event(uint32_t timeout_ms) {
             FuriHalNfcError err = pn532_send_command(cmd, idx, resp, &resp_len, slice);
 
             if(err == FuriHalNfcErrorNone && resp_len >= 1) {
-                FURI_LOG_I(TAG, "Listener activated: mode=%02X", resp[0]);
-                listener_activated = true;
+                /* TgInitAsTarget response "Mode" byte (UM0701 §7.3.21):
+                 *   bits 0-1 = baud rate (0=106, 1=212, 2=424 kbps)
+                 *   bit 2    = ISO/IEC 14443-4 PICC activated
+                 *   bit 3    = DEP (NFC-DEP / P2P)
+                 * MIFARE Ultralight / NTAG is bare ISO14443-3A @106 kbps.
+                 * FeliCa runs at 212/424 kbps, so any non-106 baud (or DEP)
+                 * means the reader probed FeliCa/P2P, not our type-A tag —
+                 * a reading Flipper would then mis-detect it as FeliCa.
+                 * Reject those activations and keep re-issuing TgInitAsTarget
+                 * so we only "go live" on the ISO14443-3A activation. */
+                uint8_t pn532_mode = resp[0];
+                bool is_iso14443a_106 =
+                    ((pn532_mode & 0x03) == 0x00) && ((pn532_mode & 0x08) == 0x00);
 
-                if(resp_len > 1) {
-                    listener_rx_len = resp_len - 1;
-                    if(listener_rx_len > sizeof(listener_rx_buf))
-                        listener_rx_len = sizeof(listener_rx_buf);
-                    memcpy(listener_rx_buf, &resp[1], listener_rx_len);
+                if(!is_iso14443a_106) {
+                    /* Wrong protocol — discard and retry TgInitAsTarget */
+                    if(timeout_ms != FURI_HAL_NFC_EVENT_WAIT_FOREVER) {
+                        if(remaining <= slice) return FuriHalNfcEventTimeout;
+                        remaining -= slice;
+                    }
+                    continue;
                 }
 
-                return (FuriHalNfcEvent)(FuriHalNfcEventFieldOn | FuriHalNfcEventListenerActive);
+                FURI_LOG_I(TAG, "Listener activated: mode=%02X", pn532_mode);
+                listener_activated = true;
+
+                bool have_first_cmd = false;
+                if(resp_len > 1) {
+                    size_t n = resp_len - 1;
+                    if(n > sizeof(listener_rx_buf) - 2) n = sizeof(listener_rx_buf) - 2;
+                    memcpy(listener_rx_buf, &resp[1], n);
+                    /* PN532 strips the reader's CRC in target mode; the upper
+                     * iso14443_3a listener runs iso14443_crc_check and only
+                     * dispatches a StandardFrame if it passes. Re-append CRC-A
+                     * (mirrors the poller RX crc_a_append translation). */
+                    crc_a_append(listener_rx_buf, n);
+                    listener_rx_len = n + 2;
+                    have_first_cmd = true;
+                }
+
+                /* If a reader command was buffered at activation, it MUST be
+                 * delivered with RxEnd — the nfc.c listener loop only calls
+                 * furi_hal_nfc_listener_rx() on RxEnd. FieldOn/ListenerActive
+                 * alone just sets state, so the command would be dropped and
+                 * the reader would time out (PN532 status 0x25). */
+                FuriHalNfcEvent ev = FuriHalNfcEventFieldOn | FuriHalNfcEventListenerActive;
+                if(have_first_cmd) ev |= FuriHalNfcEventRxEnd;
+                return ev;
             }
 
             if(timeout_ms != FURI_HAL_NFC_EVENT_WAIT_FOREVER) {
@@ -632,11 +903,16 @@ FuriHalNfcEvent furi_hal_nfc_listener_wait_event(uint32_t timeout_ms) {
             FuriHalNfcError err = pn532_send_command(cmd, sizeof(cmd), resp, &resp_len, slice);
 
             if(err == FuriHalNfcErrorNone && resp_len >= 1 && resp[0] == PN532_STATUS_OK) {
-                listener_rx_len = (resp_len > 1) ? (resp_len - 1) : 0;
-                if(listener_rx_len > sizeof(listener_rx_buf))
-                    listener_rx_len = sizeof(listener_rx_buf);
-                if(listener_rx_len > 0)
-                    memcpy(listener_rx_buf, &resp[1], listener_rx_len);
+                size_t n = (resp_len > 1) ? (resp_len - 1) : 0;
+                if(n > sizeof(listener_rx_buf) - 2) n = sizeof(listener_rx_buf) - 2;
+                if(n > 0) {
+                    memcpy(listener_rx_buf, &resp[1], n);
+                    /* Re-append CRC-A stripped by the PN532 (see first-cmd path) */
+                    crc_a_append(listener_rx_buf, n);
+                    listener_rx_len = n + 2;
+                } else {
+                    listener_rx_len = 0;
+                }
 
                 return (FuriHalNfcEvent)(FuriHalNfcEventRxEnd);
             }
@@ -738,6 +1014,24 @@ FuriHalNfcError furi_hal_nfc_poller_tx(const uint8_t* tx_data, size_t tx_bits) {
     size_t tx_bytes = (tx_bits + 7) / 8;
     pn532_rx_bits = 0;
 
+    /* === 0. MIFARE Backdoor Auth (FM11RF08 clones): 0x64/0x65 ===
+     * The PN532 cannot send raw Crypto1 frames through InDataExchange — it
+     * interprets 0x60/0x61 as native MIFARE Auth and rejects the unknown
+     * 0x64/0x65 commands with a data-format error. The Flipper's MIFARE
+     * Classic poller probes these to detect Fudan/Infineon backdoors and
+     * expects a Timeout / Protocol error to mean "no backdoor". Returning
+     * the data-format error from the PN532 leaves the poller stuck in
+     * MfClassicPollerStateAnalyzeBackdoor (no state transition matches
+     * MfClassicErrorNotPresent). Short-circuit with a clean Timeout so the
+     * backdoor probe terminates and the standard dictionary attack starts. */
+    if(pn532_target_number > 0 && tx_bytes >= 2 &&
+       (tx_data[0] == 0x64 || tx_data[0] == 0x65)) {
+        if(nfc_event_flags)
+            furi_event_flag_set(nfc_event_flags,
+                FuriHalNfcEventTxEnd | FuriHalNfcEventTimerFwtExpired);
+        return FuriHalNfcErrorCommunicationTimeout;
+    }
+
     /* === 1. SELECT interception (CL1/CL2/CL3 with NVB=0x70) === */
     if(pn532_target_number > 0 && tx_bytes >= 2 &&
        (tx_data[0] == 0x93 || tx_data[0] == 0x95 || tx_data[0] == 0x97) &&
@@ -749,7 +1043,7 @@ FuriHalNfcError furi_hal_nfc_poller_tx(const uint8_t* tx_data, size_t tx_bits) {
         pn532_rx_buf[0] = sak;
         crc_a_append(pn532_rx_buf, 1);
         pn532_rx_bits = 24;
-        FURI_LOG_I(TAG, "SELECT CL%d SAK=%02X", cascade + 1, sak);
+        FURI_LOG_D(TAG, "SELECT CL%d SAK=%02X", cascade + 1, sak);
         if(nfc_event_flags)
             furi_event_flag_set(nfc_event_flags,
                 FuriHalNfcEventTxEnd | FuriHalNfcEventRxStart | FuriHalNfcEventRxEnd);
@@ -952,20 +1246,51 @@ FuriHalNfcError furi_hal_nfc_poller_tx(const uint8_t* tx_data, size_t tx_bits) {
         return FuriHalNfcErrorCommunicationTimeout;
     }
 
-    FURI_LOG_I(TAG, "TRX: %u bytes dep=%d cmd=%02X",
+    FURI_LOG_D(TAG, "TRX: %u bytes dep=%d cmd=%02X",
         (unsigned)payload_len, pn532_iso_dep_mode,
         payload_len > 0 ? payload[0] : 0);
 
-    /* Build InDataExchange command */
-    uint8_t cmd[payload_len + 2];
-    cmd[0] = PN532_CMD_INDATAEXCHANGE;
-    cmd[1] = pn532_target_number;
-    if(payload_len > 0) memcpy(&cmd[2], payload, payload_len);
+    /* NTAG/Ultralight raw commands (READ, GET_VERSION, READ_SIG, READ_CNT,
+     * FAST_READ, CHECK_TEARING) are NOT handled correctly by the PN532's
+     * InDataExchange MIFARE state machine — it returns an error status and
+     * de-selects the target instead of relaying the card's reply (e.g. READ
+     * of the NTAG213 PWD/PACK config pages 43/44 fails, making a blank tag
+     * look password-protected). The PN532 still has automatic CRC+parity
+     * enabled from InListPassiveTarget (type A), so InCommunicateThru relays
+     * these frames transparently with identical CRC translation.
+     *
+     * Gated on !pn532_mf_authed: MIFARE Classic also uses READ (0x30) but its
+     * post-authentication reads MUST stay on InDataExchange so the PN532
+     * applies the Crypto1 stream cipher. Classic only issues 0x30 after a
+     * successful native auth (pn532_mf_authed == true), so blank/NTAG reads
+     * (always unauthed) safely take the InCommunicateThru path. */
+    bool use_comm_thru = !pn532_iso_dep_mode && !pn532_mf_authed && payload_len >= 1 &&
+                         (payload[0] == 0x30 || /* READ */
+                          payload[0] == 0x60 || /* GET_VERSION */
+                          payload[0] == 0x3C || /* READ_SIG */
+                          payload[0] == 0x39 || /* READ_CNT */
+                          payload[0] == 0x3A || /* FAST_READ */
+                          payload[0] == 0x3E || /* CHECK_TEARING */
+                          payload[0] == 0x1A || /* AUTH (Ultralight-C) */
+                          payload[0] == 0x1B); /* PWD_AUTH (NTAG/UL EV1) */
+
+    /* Build PN532 command:
+     *   InDataExchange:    [0x40] [Tg] [payload...]
+     *   InCommunicateThru: [0x42] [payload...]   (no target number byte) */
+    size_t cmd_hdr = use_comm_thru ? 1 : 2;
+    uint8_t cmd[payload_len + cmd_hdr];
+    if(use_comm_thru) {
+        cmd[0] = PN532_CMD_INCOMMUNICATETHRU;
+    } else {
+        cmd[0] = PN532_CMD_INDATAEXCHANGE;
+        cmd[1] = pn532_target_number;
+    }
+    if(payload_len > 0) memcpy(&cmd[cmd_hdr], payload, payload_len);
 
     uint8_t resp[253];
     size_t resp_len = sizeof(resp);
 
-    FuriHalNfcError err = pn532_send_command(cmd, payload_len + 2, resp, &resp_len, 5000);
+    FuriHalNfcError err = pn532_send_command(cmd, payload_len + cmd_hdr, resp, &resp_len, 5000);
 
     if(err == FuriHalNfcErrorNone && resp_len >= 1) {
         uint8_t status = resp[0];
@@ -994,7 +1319,7 @@ FuriHalNfcError furi_hal_nfc_poller_tx(const uint8_t* tx_data, size_t tx_bits) {
                 pn532_rx_bits = (data_len + 2) * 8;
             }
 
-            FURI_LOG_I(TAG, "TRX OK: %u bits [%02X %02X %02X %02X...]",
+            FURI_LOG_D(TAG, "TRX OK: %u bits [%02X %02X %02X %02X...]",
                 (unsigned)pn532_rx_bits,
                 pn532_rx_buf[0],
                 pn532_rx_bits > 8 ? pn532_rx_buf[1] : 0,
@@ -1005,7 +1330,7 @@ FuriHalNfcError furi_hal_nfc_poller_tx(const uint8_t* tx_data, size_t tx_bits) {
                     FuriHalNfcEventTxEnd | FuriHalNfcEventRxStart | FuriHalNfcEventRxEnd);
         } else {
             err = pn532_status_to_error(status);
-            FURI_LOG_I(TAG, "TRX err: %02X", status);
+            FURI_LOG_D(TAG, "TRX err: %02X", status);
             /* Self-heal stale cache: clear on any PN532 status that means "the
              * cached target is no longer present / valid". Comm-level errors
              * (CRC 0x02, parity 0x03, framing 0x05 within ISO-DEP, collision
@@ -1015,7 +1340,7 @@ FuriHalNfcError furi_hal_nfc_poller_tx(const uint8_t* tx_data, size_t tx_bits) {
              *   0x2A UID mismatch, anything >= 0x40 catastrophic. */
             if(status == 0x01 || status == 0x0A || status == 0x25 || status == 0x26 ||
                status == 0x29 || status == 0x2A || status >= 0x40) {
-                FURI_LOG_I(TAG, "InDataExchange err 0x%02X -> invalidate cache", status);
+                FURI_LOG_D(TAG, "InDataExchange err 0x%02X -> invalidate cache", status);
                 pn532_target_number = 0;
                 pn532_iso_dep_active = false;
                 pn532_iso_dep_mode = false;
@@ -1029,7 +1354,7 @@ FuriHalNfcError furi_hal_nfc_poller_tx(const uint8_t* tx_data, size_t tx_bits) {
     } else {
         if(err == FuriHalNfcErrorNone) err = FuriHalNfcErrorCommunicationTimeout;
         /* Communication-level failure (I2C error or no response) — also stale */
-        FURI_LOG_I(TAG, "InDataExchange comm fail err=%d -> invalidate cache", (int)err);
+        FURI_LOG_D(TAG, "InDataExchange comm fail err=%d -> invalidate cache", (int)err);
         pn532_target_number = 0;
         pn532_iso_dep_active = false;
         pn532_iso_dep_mode = false;
@@ -1063,11 +1388,18 @@ FuriHalNfcError furi_hal_nfc_listener_tx(const uint8_t* tx_data, size_t tx_bits)
     if(!nfc_hal_ready) return FuriHalNfcErrorCommunication;
 
     size_t tx_bytes = (tx_bits + 7) / 8;
-    uint8_t cmd[tx_bytes + 1];
-    cmd[0] = PN532_CMD_TGRESPONSETOINITIATOR;
-    memcpy(&cmd[1], tx_data, tx_bytes);
+    /* The iso14443_3a listener appends CRC-A to standard frames, but the PN532
+     * adds its own CRC in type-A target mode (same as InDataExchange on the
+     * poller side). Strip the trailing 2-byte CRC so the reader doesn't see a
+     * double CRC. 4-bit ACK/NAK frames (tx_bytes < 3) carry no CRC. */
+    size_t payload_len = tx_bytes;
+    if(payload_len >= 3) payload_len -= 2;
 
-    return pn532_send_command(cmd, tx_bytes + 1, NULL, NULL, 1000);
+    uint8_t cmd[payload_len + 1];
+    cmd[0] = PN532_CMD_TGRESPONSETOINITIATOR;
+    memcpy(&cmd[1], tx_data, payload_len);
+
+    return pn532_send_command(cmd, payload_len + 1, NULL, NULL, 1000);
 }
 
 FuriHalNfcError furi_hal_nfc_listener_rx(uint8_t* rx_data, size_t rx_data_size, size_t* rx_bits) {
@@ -1210,7 +1542,7 @@ FuriHalNfcError furi_hal_nfc_iso14443a_poller_trx_short_frame(FuriHalNfcaShortFr
         }
 
         pn532_cache_time_us = esp_timer_get_time();
-        FURI_LOG_I(TAG, "Tag: ATQA=%02X%02X SAK=%02X UID=%dB iso_dep=%d",
+        FURI_LOG_D(TAG, "Tag: ATQA=%02X%02X SAK=%02X UID=%dB iso_dep=%d",
             pn532_target_atqa[0], pn532_target_atqa[1], pn532_target_sak,
             pn532_target_uid_len, pn532_iso_dep_active);
 
@@ -1430,8 +1762,9 @@ FuriHalNfcError furi_hal_nfc_iso14443a_listener_set_col_res_data(
     listener_activated = false;
     listener_rx_len = 0;
 
-    FURI_LOG_I(TAG, "Listener configured: ATQA=%02X%02X SAK=%02X UID=%dB",
-        atqa[0], atqa[1], sak, uid_len);
+    FURI_LOG_I(TAG, "Listener configured: ATQA=%02X%02X SAK=%02X UID=%dB → emu path: %s",
+        atqa[0], atqa[1], sak, uid_len,
+        (emu_ndef_len > 0) ? "Type-4 ISO-DEP NDEF" : "RAW type-A (PN532 can't emulate NTAG)");
 
     return FuriHalNfcErrorNone;
 }
@@ -1528,7 +1861,7 @@ FuriHalNfcError furi_hal_nfc_pn532_mf_auth(
 
     if(err == FuriHalNfcErrorNone && resp_len >= 1 && resp[0] == PN532_STATUS_OK) {
         pn532_mf_authed = true;
-        FURI_LOG_I(TAG, "MF auth OK: block=%d key_type=%d", block_num, key_type);
+        FURI_LOG_D(TAG, "MF auth OK: block=%d key_type=%d", block_num, key_type);
         return FuriHalNfcErrorNone;
     }
 
