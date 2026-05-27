@@ -3,7 +3,7 @@
  * Board definition: Custom ESP32-S3 ILI9341 6-Button Board
  *
  * MCU:      ESP32-S3
- * Display:  ILI9341 240x320 RGB565 via SPI
+ * Display:  st7789 135x240 RGB565 via SPI
  * Input:    6 discrete buttons
  * SubGHz:   CC1101 via SPI
  * NFC:      PN532 via I2C
@@ -21,10 +21,10 @@
 /* ---- Hardware Button Pins ---- */
 #define BOARD_PIN_BTN_UP        41
 #define BOARD_PIN_BTN_DOWN      40
-#define BOARD_PIN_BTN_LEFT      38
-#define BOARD_PIN_BTN_RIGHT     39
+#define BOARD_PIN_BTN_LEFT      39
+#define BOARD_PIN_BTN_RIGHT     38
 #define BOARD_PIN_BTN_OK        0
-#define BOARD_PIN_BTN_BACK      4
+#define BOARD_PIN_BTN_BACK      10
 #define BOARD_PIN_BUTTON_BOOT   0  
 #define BOARD_PIN_BATTERY_ADC   2
 
@@ -37,20 +37,20 @@
 #define BOARD_PIN_LCD_BL        6
 
 /* ---- LCD Display Configuration ---- */
-#define BOARD_LCD_H_RES         320     /* Native width after swap_xy */
-#define BOARD_LCD_V_RES         240     /* Native height after swap_xy */
+#define BOARD_LCD_H_RES         240    
+#define BOARD_LCD_V_RES         135     
 #define BOARD_LCD_SPI_HOST      SPI2_HOST
 #define BOARD_LCD_SPI_FREQ_HZ   (20 * 1000 * 1000)
 #define BOARD_LCD_CMD_BITS      8
 #define BOARD_LCD_PARAM_BITS    8
 #define BOARD_LCD_SWAP_XY       true
-#define BOARD_LCD_MIRROR_X      false
+#define BOARD_LCD_MIRROR_X      true
 #define BOARD_LCD_MIRROR_Y      false
-#define BOARD_LCD_INVERT_COLOR  false   /* ILI9341 does not need inversion */
-#define BOARD_LCD_GAP_X         0
-#define BOARD_LCD_GAP_Y         0
+#define BOARD_LCD_INVERT_COLOR  true   
+#define BOARD_LCD_GAP_X         40
+#define BOARD_LCD_GAP_Y         53
 #define BOARD_LCD_BL_ACTIVE_LOW false
-#define BOARD_LCD_COLOR_ORDER_BGR true
+#define BOARD_LCD_COLOR_ORDER_BGR false
 
 /* Flipper framebuffer → display color mapping (RGB565) */
 #define BOARD_LCD_FG_COLOR      0xA0FD
