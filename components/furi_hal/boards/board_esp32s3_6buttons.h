@@ -29,8 +29,8 @@
 #define BOARD_PIN_BATTERY_ADC   2
 
 /* ---- LCD Pins (ILI9341 via SPI) ---- */
-#define BOARD_PIN_LCD_MOSI      17
-#define BOARD_PIN_LCD_SCLK      18
+#define BOARD_PIN_LCD_MOSI      35
+#define BOARD_PIN_LCD_SCLK      36
 #define BOARD_PIN_LCD_DC        15
 #define BOARD_PIN_LCD_CS        7
 #define BOARD_PIN_LCD_RST       16
@@ -46,11 +46,11 @@
 #define BOARD_LCD_SWAP_XY       true
 #define BOARD_LCD_MIRROR_X      true
 #define BOARD_LCD_MIRROR_Y      false
-#define BOARD_LCD_INVERT_COLOR  true   
+#define BOARD_LCD_INVERT_COLOR  false 
 #define BOARD_LCD_GAP_X         40
 #define BOARD_LCD_GAP_Y         53
 #define BOARD_LCD_BL_ACTIVE_LOW false
-#define BOARD_LCD_COLOR_ORDER_BGR false
+#define BOARD_LCD_COLOR_ORDER_BGR true
 
 /* Flipper framebuffer → display color mapping (RGB565) */
 #define BOARD_LCD_FG_COLOR      0xA0FD
