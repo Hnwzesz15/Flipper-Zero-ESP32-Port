@@ -18,8 +18,7 @@
 #include <driver/gpio.h>
 #include <driver/spi_master.h>
 #include <esp_lcd_panel_io.h>
-//#include "esp_lcd_ili9341.h"
-#include <esp_lcd_panel_vendor.h> //added
+#include <esp_lcd_panel_vendor.h>
 #include <esp_lcd_panel_ops.h>
 #include <freertos/semphr.h>
 
@@ -34,13 +33,8 @@ static const char* TAG = "FuriHalDisplay";
 #define FB_HEIGHT 64
 
 /* Scale the 128x64 framebuffer to the largest centered size that keeps aspect ratio. */
-#if (LCD_H_RES * FB_HEIGHT) <= (LCD_V_RES * FB_WIDTH)
 #define SCALED_WIDTH  LCD_H_RES
-#define SCALED_HEIGHT ((LCD_H_RES * FB_HEIGHT) / FB_WIDTH)
-#else
 #define SCALED_HEIGHT LCD_V_RES
-#define SCALED_WIDTH  ((LCD_V_RES * FB_WIDTH) / FB_HEIGHT)
-#endif
 
 /* Centering margins */
 #define MARGIN_X ((LCD_H_RES - SCALED_WIDTH) / 2)
@@ -226,8 +220,7 @@ void furi_hal_display_init(void) {
 
     ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(io_handle, &panel_config, &panel_handle));
 
-    
-    /* Reset and initialize (the esp_lcd driver reset is redundant now but harmless) */
+    /* 3) esp_lcd does another RESX pulse, then SLPOUT + COLMOD + MADCTL. */
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
 
