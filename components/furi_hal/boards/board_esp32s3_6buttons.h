@@ -99,7 +99,7 @@
 #define BOARD_PIN_IR_RX         4 
 
 /* ---- NFC / PN532 (via I2C) ---- */
-#define BOARD_PIN_NFC_SCL       42
+#define BOARD_PIN_NFC_SCL       48
 #define BOARD_PIN_NFC_SDA       47
 #define BOARD_PIN_NFC_IRQ       UINT16_MAX
 #define BOARD_PIN_NFC_RST       UINT16_MAX
@@ -111,7 +111,7 @@
 #define BOARD_PIN_SPEAKER_DOUT  UINT16_MAX
 
 /* ---- WS2812 RGB LED ---- */
-#define BOARD_PIN_WS2812_DATA   48
+#define BOARD_PIN_WS2812_DATA   45
 #define BOARD_WS2812_LED_COUNT  1
 
 /* ---- Microphone ---- */
